@@ -18,7 +18,7 @@
  * Buffer structure
  */
 struct buffer {
-    void *start;
+    char *start;
     size_t length;
 };
 
@@ -44,6 +44,41 @@ static int _ioctl(int fh, int request, void *arg)
     } while (-1 == r && EINTR == errno);
 
     return r;
+}
+
+/**
+ * Private function to equalize the Y-histogram for contrast
+ * using a cumulative distribution function
+ *
+ * http://en.wikipedia.org/wiki/Histogram_equalization
+ */
+static void equalize(struct buffer *buf)
+{
+    size_t i;
+    unsigned int depth = 1 << 8;
+    unsigned char value;
+
+    size_t *histogram = calloc(depth, sizeof(size_t));
+    size_t *cdf = calloc(depth, sizeof(size_t));
+    size_t cdf_min = 0;
+
+    // Skip CbCr components
+    for (i = 0; i < buf->length; i += 2)
+    {
+        histogram[(unsigned char)buf->start[i]]++;
+    }
+
+    // Create cumulative distribution
+    for (i = 0; i < depth; i++) {
+        cdf[i] = 0 == i ? histogram[i] : cdf[i - 1] + histogram[i];
+        if (cdf_min == 0 && cdf[i] > 0) cdf_min = cdf[i];
+    }
+
+    // Equalize the Y values
+    for (i = 0; i < buf->length; i += 2) {
+        value = (unsigned char)buf->start[i];
+        buf->start[i] = 1.0 * (cdf[value] - cdf_min) / (buf->length / 2 - cdf_min) * (depth - 1);
+    }
 }
 
 /**
@@ -187,8 +222,8 @@ struct webcam *webcam_open(const char *dev)
 void webcam_read(struct webcam *w)
 {
     int i;
-    FILE *out;
-    char *fn;
+    FILE *out1, *out2;
+    char *fn1, *fn2;
 
     struct v4l2_buffer buf;
     enum v4l2_buf_type type;
@@ -214,12 +249,13 @@ void webcam_read(struct webcam *w)
     }
 
     // Prepare output file
-    fn = calloc(15, sizeof(char));
-    sprintf(fn, "frame.yuv");
-    out = fopen(fn, "w+");
+    fn1 = calloc(15, sizeof(char));
+    sprintf(fn1, "frame.yuv");
+    out1 = fopen(fn1, "w+");
 
-    // Sleep to let webcam calibrate?
-    sleep(5);
+    fn2 = calloc(15, sizeof(char));
+    sprintf(fn2, "equalized.yuv");
+    out2 = fopen(fn2, "w+");
 
     // Try getting an image from the device
     for(;;) {
@@ -243,11 +279,18 @@ void webcam_read(struct webcam *w)
         // Make sure we are not out of bounds
         assert(buf.index < w->nbuffers);
 
+        // Save retrieved image
         fprintf(stderr, "Retrieved buffer %d of size %d (or %d) bytes from mmap\n", buf.index, buf.bytesused, buf.length);
+        fwrite(w->buffers[buf.index].start, w->buffers[buf.index].length, 1, out1);
+        fclose(out1);
 
-        // Save given buffer into the output file
-        fwrite(w->buffers[buf.index].start, w->buffers[buf.index].length, 1, out);
-        fclose(out);
+        // Apply histogram stretching on the buffer in the Y channel
+        fprintf(stderr, "Equalizing buffer\n");
+        equalize(&(w->buffers[buf.index]));
+
+        // Save resulting buffer into the output file
+        fwrite(w->buffers[buf.index].start, w->buffers[buf.index].length, 1, out2);
+        fclose(out2);
         break;
     }
 
