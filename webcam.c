@@ -30,6 +30,8 @@ struct webcam {
     int             fd;
     struct buffer   *buffers;
     unsigned int    nbuffers;
+
+    struct buffer   frame;
 };
 
 /**
@@ -47,8 +49,71 @@ static int _ioctl(int fh, int request, void *arg)
 }
 
 /**
+ * Private function to clamp a double value to the nearest int
+ * between 0 and 255
+ */
+static int clamp(double x)
+{
+    int r = x;
+
+    if (r < 0) return 0;
+    else if (r > 255) return 255;
+
+    return r;
+}
+
+/**
+ * Private function to convert a YUYV buffer to a RGB frame and store it
+ * within the given webcam structure
+ *
+ * http://linuxtv.org/downloads/v4l-dvb-apis/colorspaces.html
+ */
+static convertToRGB(struct buffer buf, struct webcam *w)
+{
+    size_t i;
+    unsigned char y, u, v;
+
+    int uOffset = 0;
+    int vOffset = 0;
+
+    double R, G, B;
+    double Y, Pb, Pr;
+
+    // Initialize webcam frame
+    if (w->frame.start == NULL) {
+        w->frame.length = buf.length / 2 * 3;
+        w->frame.start = calloc(w->frame.length, sizeof(char));
+    }
+
+    for (i = 0; i < buf.length; i += 2)
+    {
+        uOffset = (i % 4 == 0) ? 1 : -1;
+        vOffset = (i % 4 == 2) ? 1 : -1;
+
+        y = buf.start[i];
+        u = (i + uOffset > 0 && i + uOffset < buf.length) ? buf.start[i + uOffset] : 0x80;
+        v = (i + vOffset > 0 && i + vOffset < buf.length) ? buf.start[i + vOffset] : 0x80;
+
+        Y =  (255.0 / 219.0) * (y - 0x10);
+        Pb = (255.0 / 224.0) * (u - 0x80);
+        Pr = (255.0 / 224.0) * (v - 0x80);
+
+        R = 1.0 * Y + 0.000 * Pb + 1.402 * Pr;
+        G = 1.0 * Y + 0.344 * Pb - 0.714 * Pr;
+        B = 1.0 * Y + 1.772 * Pb + 0.000 * Pr;
+
+        w->frame.start[i / 2 * 3    ] = clamp(R);
+        w->frame.start[i / 2 * 3 + 1] = clamp(G);
+        w->frame.start[i / 2 * 3 + 2] = clamp(B);
+    }
+}
+
+/**
  * Private function to equalize the Y-histogram for contrast
  * using a cumulative distribution function
+ *
+ * Thought this would fix the colors in the first instance,
+ * but it did not. Nevertheless a good function to keep.
  *
  * http://en.wikipedia.org/wiki/Histogram_equalization
  */
@@ -141,6 +206,8 @@ struct webcam *webcam_open(const char *dev)
     w = calloc(1, sizeof(struct webcam));
     w->fd = fd;
     w->name = strdup(dev);
+    w->frame.start = NULL;
+    w->frame.length = 0;
 
     // Request the webcam's buffers for memory-mapping
     struct v4l2_requestbuffers req;
@@ -219,43 +286,13 @@ struct webcam *webcam_open(const char *dev)
     return w;
 }
 
+/**
+ * Reads a frame from the webcam, converts it into the RGB colorspace
+ * and stores it in the webcam structure
+ */
 void webcam_read(struct webcam *w)
 {
-    int i;
-    FILE *out1, *out2;
-    char *fn1, *fn2;
-
     struct v4l2_buffer buf;
-    enum v4l2_buf_type type;
-
-    // Clear buffers
-    for (i = 0; i < w->nbuffers; i++) {
-        CLEAR(buf);
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buf.memory = V4L2_MEMORY_MMAP;
-        buf.index = i;
-
-        if (-1 == _ioctl(w->fd, VIDIOC_QBUF, &buf)) {
-            fprintf(stderr, "Error clearing buffers on %s\n", w->name);
-            return;
-        }
-    }
-
-    // Turn on streaming
-    type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    if (-1 == _ioctl(w->fd, VIDIOC_STREAMON, &type)) {
-        fprintf(stderr, "Could not turn on streaming on %s\n", w->name);
-        return;
-    }
-
-    // Prepare output file
-    fn1 = calloc(15, sizeof(char));
-    sprintf(fn1, "frame.yuv");
-    out1 = fopen(fn1, "w+");
-
-    fn2 = calloc(15, sizeof(char));
-    sprintf(fn2, "equalized.yuv");
-    out2 = fopen(fn2, "w+");
 
     // Try getting an image from the device
     for(;;) {
@@ -279,18 +316,7 @@ void webcam_read(struct webcam *w)
         // Make sure we are not out of bounds
         assert(buf.index < w->nbuffers);
 
-        // Save retrieved image
-        fprintf(stderr, "Retrieved buffer %d of size %d (or %d) bytes from mmap\n", buf.index, buf.bytesused, buf.length);
-        fwrite(w->buffers[buf.index].start, w->buffers[buf.index].length, 1, out1);
-        fclose(out1);
-
-        // Apply histogram stretching on the buffer in the Y channel
-        fprintf(stderr, "Equalizing buffer\n");
-        equalize(&(w->buffers[buf.index]));
-
-        // Save resulting buffer into the output file
-        fwrite(w->buffers[buf.index].start, w->buffers[buf.index].length, 1, out2);
-        fclose(out2);
+        convertToRGB(w->buffers[buf.index], w);
         break;
     }
 
@@ -299,8 +325,46 @@ void webcam_read(struct webcam *w)
         fprintf(stderr, "Error while swapping buffers on %s\n", w->name);
         return;
     }
+}
 
+/**
+ * Tells the webcam to go into streaming mode
+ */
+void webcam_start_streaming(struct webcam *w)
+{
+    int i;
+
+    struct v4l2_buffer buf;
+    enum v4l2_buf_type type;
+
+    // Clear buffers
+    for (i = 0; i < w->nbuffers; i++) {
+        CLEAR(buf);
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
+
+        if (-1 == _ioctl(w->fd, VIDIOC_QBUF, &buf)) {
+            fprintf(stderr, "Error clearing buffers on %s\n", w->name);
+            return;
+        }
+    }
+
+    // Turn on streaming
+    type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (-1 == _ioctl(w->fd, VIDIOC_STREAMON, &type)) {
+        fprintf(stderr, "Could not turn on streaming on %s\n", w->name);
+        return;
+    }
+}
+
+/**
+ * Tells the webcam to abort the streaming mode
+ */
+void webcam_stop_streaming(struct webcam *w)
+{
     // Turn off streaming
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (-1 == _ioctl(w->fd, VIDIOC_STREAMOFF, &type)) {
         fprintf(stderr, "Could not turn streaming off on %s\n", w->name);
         return;
@@ -311,9 +375,18 @@ void webcam_read(struct webcam *w)
  * Main code
  */
 int main(int argc, char **argv) {
+    unsigned char *frame;
     struct webcam *w = webcam_open("/dev/video0");
 
+    webcam_start_streaming(w);
     webcam_read(w);
+    webcam_stop_streaming(w);
+
+    if (w->frame.start != NULL) {
+        FILE *out = fopen("frame.rgb", "w+");
+        fwrite(w->frame.start, w->frame.length, 1, out);
+        fclose(out);
+    }
 
     return 0;
 }
