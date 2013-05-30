@@ -34,7 +34,7 @@ static uint8_t clamp(double x)
  *
  * http://linuxtv.org/downloads/v4l-dvb-apis/colorspaces.html
  */
-static convertToRGB(struct buffer buf, struct webcam *w)
+static convertToRGB(struct buffer buf, struct buffer *frame)
 {
     size_t i;
     uint8_t y, u, v;
@@ -46,9 +46,9 @@ static convertToRGB(struct buffer buf, struct webcam *w)
     double Y, Pb, Pr;
 
     // Initialize webcam frame
-    if (w->frame.start == NULL) {
-        w->frame.length = buf.length / 2 * 3;
-        w->frame.start = calloc(w->frame.length, sizeof(char));
+    if (frame->start == NULL) {
+        frame->length = buf.length / 2 * 3;
+        frame->start = calloc(frame->length, sizeof(char));
     }
 
     // Go through the YUYV buffer and calculate RGB pixels
@@ -69,9 +69,9 @@ static convertToRGB(struct buffer buf, struct webcam *w)
         G = 1.0 * Y + 0.344 * Pb - 0.714 * Pr;
         B = 1.0 * Y + 1.772 * Pb + 0.000 * Pr;
 
-        w->frame.start[i / 2 * 3    ] = clamp(R);
-        w->frame.start[i / 2 * 3 + 1] = clamp(G);
-        w->frame.start[i / 2 * 3 + 2] = clamp(B);
+        frame->start[i / 2 * 3    ] = clamp(R);
+        frame->start[i / 2 * 3 + 1] = clamp(G);
+        frame->start[i / 2 * 3 + 2] = clamp(B);
     }
 }
 
@@ -173,6 +173,7 @@ struct webcam *webcam_open(const char *dev)
     w->name = strdup(dev);
     w->frame.start = NULL;
     w->frame.length = 0;
+    pthread_mutex_init(&w->mtx_frame, NULL);
 
     // Initialize buffers
     w->nbuffers = 0;
@@ -295,7 +296,7 @@ void webcam_resize(webcam_t *w, uint16_t width, uint16_t height)
  * Reads a frame from the webcam, converts it into the RGB colorspace
  * and stores it in the webcam structure
  */
-void webcam_read(struct webcam *w)
+static void webcam_read(struct webcam *w)
 {
     struct v4l2_buffer buf;
 
@@ -306,7 +307,6 @@ void webcam_read(struct webcam *w)
         buf.memory = V4L2_MEMORY_MMAP;
 
         // Dequeue a (filled) buffer from the video device
-        fprintf(stderr, "%s: Getting a %ux%u image from the webcam\n", w->name, w->width, w->height);
         if (-1 == _ioctl(w->fd, VIDIOC_DQBUF, &buf)) {
             switch(errno) {
                 case EAGAIN:
@@ -322,8 +322,10 @@ void webcam_read(struct webcam *w)
         // Make sure we are not out of bounds
         assert(buf.index < w->nbuffers);
 
-        fprintf(stderr, "%s: Converting into RGB\n");
-        convertToRGB(w->buffers[buf.index], w);
+        // Lock frame mutex, and store RGB
+        pthread_mutex_lock(&w->mtx_frame);
+        convertToRGB(w->buffers[buf.index], &w->frame);
+        pthread_mutex_unlock(&w->mtx_frame);
         break;
     }
 
@@ -335,7 +337,22 @@ void webcam_read(struct webcam *w)
 }
 
 /**
- * Tells the webcam to go into streaming mode
+ * The loop function for the webcam thread
+ */
+static void *webcam_streaming(void *ptr)
+{
+    webcam_t *w = (webcam_t *)ptr;
+
+    while(w->streaming) webcam_read(w);
+}
+
+/**
+ * Tells the webcam to go into streaming mode, or to
+ * stop streaming.
+ * When going into streaming mode, it also creates
+ * a thread running the webcam_streaming function.
+ * When exiting the streaming mode, it sets the streaming
+ * bit to false, and waits for the thread to finish.
  */
 void webcam_stream(struct webcam *w, bool flag)
 {
@@ -364,7 +381,15 @@ void webcam_stream(struct webcam *w, bool flag)
             fprintf(stderr, "Could not turn on streaming on %s\n", w->name);
             return;
         }
+
+        // Set streaming to true and start thread
+        w->streaming = true;
+        pthread_create(&w->thread, NULL, webcam_streaming, (void *)w);
     } else {
+        // Set streaming to false and wait for thread to finish
+        w->streaming = false;
+        pthread_join(w->thread, NULL);
+
         // Turn off streaming
         type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         if (-1 == _ioctl(w->fd, VIDIOC_STREAMOFF, &type)) {
@@ -374,15 +399,47 @@ void webcam_stream(struct webcam *w, bool flag)
     }
 }
 
+buffer_t webcam_grab(webcam_t *w)
+{
+    buffer_t ret;
+
+    // Locks the frame mutex so the grabber can copy
+    // the frame in its own return buffer.
+    pthread_mutex_lock(&w->mtx_frame);
+    ret.length = w->frame.length;
+    ret.start = calloc(ret.length, sizeof(uint8_t));
+    memcpy(ret.start, w->frame.start, w->frame.length);
+    pthread_mutex_unlock(&w->mtx_frame);
+
+    return ret;
+}
+
 /**
  * Main code
  */
-int main(int argc, char **argv) {
+int main(int argc, char **argv)
+{
+    int i = 0;
     webcam_t *w = webcam_open("/dev/video0");
+
+    // Prepare frame, and filename, and file to store frame in
+    buffer_t frame;
+    char *fn = calloc(16, sizeof(char));
+    FILE *fp;
 
     webcam_resize(w, 1280, 1024);
     webcam_stream(w, true);
-    webcam_read(w);
+    for(i = 0; i < 10; i++) {
+        printf("Grabbing frame %d\n", i);
+        frame = webcam_grab(w);
+        sprintf(fn, "frame_%d.rgb", i);
+        fp = fopen(fn, "w+");
+        fwrite(frame.start, frame.length, 1, fp);
+        fclose(fp);
+        free(frame.start);
+
+        sleep(1);
+    }
     webcam_stream(w, false);
 
     if (w->frame.start != NULL) {

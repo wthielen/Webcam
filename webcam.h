@@ -4,6 +4,7 @@
 #include <fcntl.h>
 
 #include <assert.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdbool.h>
@@ -34,15 +35,18 @@ typedef struct webcam {
     uint8_t         nbuffers;
 
     buffer_t        frame;
+    pthread_t       thread;
+    pthread_mutex_t mtx_frame;
 
     uint16_t        width;
     uint16_t        height;
     uint8_t         colorspace;
 
     char            formats[16][5];
+    bool            streaming;
 } webcam_t;
 
 webcam_t *webcam_open(const char *dev);
 void webcam_resize(webcam_t *w, uint16_t width, uint16_t height);
-void webcam_read(webcam_t *w);
 void webcam_stream(webcam_t *w, bool flag);
+buffer_t webcam_grab(webcam_t *w);
