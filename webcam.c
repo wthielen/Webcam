@@ -30,11 +30,11 @@ static uint8_t clamp(double x)
 
 /**
  * Private function to convert a YUYV buffer to a RGB frame and store it
- * within the given webcam structure
+ * within the given buffer structure
  *
  * http://linuxtv.org/downloads/v4l-dvb-apis/colorspaces.html
  */
-static convertToRGB(struct buffer buf, struct buffer *frame)
+static void convertToRGB(struct buffer buf, struct buffer *frame)
 {
     size_t i;
     uint8_t y, u, v;
@@ -45,7 +45,7 @@ static convertToRGB(struct buffer buf, struct buffer *frame)
     double R, G, B;
     double Y, Pb, Pr;
 
-    // Initialize webcam frame
+    // Initialize frame
     if (frame->start == NULL) {
         frame->length = buf.length / 2 * 3;
         frame->start = calloc(frame->length, sizeof(char));
