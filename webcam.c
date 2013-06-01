@@ -198,6 +198,11 @@ struct webcam *webcam_open(const char *dev)
     return w;
 }
 
+/**
+ * Closes the webcam
+ *
+ * Also releases the buffers, and frees up memory
+ */
 void webcam_close(webcam_t *w)
 {
     uint16_t i;
@@ -211,9 +216,11 @@ void webcam_close(webcam_t *w)
         munmap(w->buffers[i].start, w->buffers[i].length);
     }
 
+    // Free allocated resources
     free(w->buffers);
     free(w->name);
 
+    // Close the webcam file descriptor, and free the memory
     close(w->fd);
     free(w);
 }
