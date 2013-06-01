@@ -198,6 +198,26 @@ struct webcam *webcam_open(const char *dev)
     return w;
 }
 
+void webcam_close(webcam_t *w)
+{
+    uint16_t i;
+
+    // Clear frame
+    free(w->frame.start);
+    w->frame.length = 0;
+
+    // Release memory-mapped buffers
+    for (i = 0; i < w->nbuffers; i++) {
+        munmap(w->buffers[i].start, w->buffers[i].length);
+    }
+
+    free(w->buffers);
+    free(w->name);
+
+    close(w->fd);
+    free(w);
+}
+
 /**
  * Sets the webcam to capture at the given width and height
  */
@@ -429,24 +449,25 @@ int main(int argc, char **argv)
 
     webcam_resize(w, 1280, 1024);
     webcam_stream(w, true);
-    for(i = 0; i < 10; i++) {
-        printf("Grabbing frame %d\n", i);
+    while(true) {
         frame = webcam_grab(w);
-        sprintf(fn, "frame_%d.rgb", i);
-        fp = fopen(fn, "w+");
-        fwrite(frame.start, frame.length, 1, fp);
-        fclose(fp);
+
+        if (frame.length > 0) {
+            printf("Storing frame %d\n", i);
+            sprintf(fn, "frame_%d.rgb", i);
+            fp = fopen(fn, "w+");
+            fwrite(frame.start, frame.length, 1, fp);
+            fclose(fp);
+            i++;
+        }
         free(frame.start);
 
-        sleep(1);
+        if (i > 50) break;
     }
     webcam_stream(w, false);
+    webcam_close(w);
 
-    if (w->frame.start != NULL) {
-        FILE *out = fopen("frame.rgb", "w+");
-        fwrite(w->frame.start, w->frame.length, 1, out);
-        fclose(out);
-    }
+    free(fn);
 
     return 0;
 }
