@@ -1,4 +1,20 @@
 #include "webcam.h"
+#include <signal.h>
+
+/**
+ * Keeping tabs on opened webcam devices
+ */
+static webcam_t *_w[16] = {
+    NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL
+};
+
+/**
+ * Private sigaction to catch segmentation fault
+ */
+static struct sigaction *sa;
 
 /**
  * Private function for successfully ioctl-ing the v4l2 device
@@ -26,6 +42,30 @@ static uint8_t clamp(double x)
     else if (r > 255) return 255;
 
     return r;
+}
+
+/**
+ * Handler for segmentation faults
+ * This should go through all the opened webcams in _w and
+ * clean them up.
+ */
+static void handler(int sig, siginfo_t *si, void *unused)
+{
+    int i = 0;
+    fprintf(stderr, "A segmentation fault occured. Cleaning up...\n");
+
+    for(i = 0; i < 16; i++) {
+        if (_w[i] == NULL) continue;
+
+        // If webcam is streaming, unlock the mutex, and stop streaming
+        if (_w[i]->streaming) {
+            pthread_mutex_unlock(&_w[i]->mtx_frame);
+            webcam_stream(_w[i], false);
+        }
+        webcam_close(_w[i]);
+    }
+
+    exit(EXIT_FAILURE);
 }
 
 /**
@@ -129,6 +169,15 @@ struct webcam *webcam_open(const char *dev)
     int fd;
     struct webcam *w;
 
+    // Prepare signal handler if not yet
+    if (sa == NULL) {
+        sa = calloc(1, sizeof(struct sigaction));
+        sa->sa_flags = SA_SIGINFO;
+        sigemptyset(&sa->sa_mask);
+        sa->sa_sigaction = handler;
+        sigaction(SIGSEGV, sa, NULL);
+    }
+
     // Check if the device path exists
     if (-1 == stat(dev, &st)) {
         fprintf(stderr, "Cannot identify '%s': %d, %s\n",
@@ -178,6 +227,15 @@ struct webcam *webcam_open(const char *dev)
     // Initialize buffers
     w->nbuffers = 0;
     w->buffers = NULL;
+
+    // Store webcam in _w
+    int i = 0;
+    for(; i < 16; i++) {
+        if (_w[i] == NULL) {
+            _w[i] = w;
+            break;
+        }
+    }
 
     // Request supported formats
     struct v4l2_fmtdesc fmtdesc;
@@ -426,24 +484,30 @@ void webcam_stream(struct webcam *w, bool flag)
     }
 }
 
-buffer_t webcam_grab(webcam_t *w)
+void webcam_grab(webcam_t *w, buffer_t *frame)
 {
-    buffer_t ret;
-
     // Locks the frame mutex so the grabber can copy
     // the frame in its own return buffer.
     pthread_mutex_lock(&w->mtx_frame);
-    ret.length = w->frame.length;
-    ret.start = calloc(ret.length, sizeof(uint8_t));
-    memcpy(ret.start, w->frame.start, w->frame.length);
-    pthread_mutex_unlock(&w->mtx_frame);
 
-    return ret;
+    // Only copy frame if there is something in the webcam's frame buffer
+    if (w->frame.length > 0) {
+        // Initialize frame
+        if ((*frame).start == NULL) {
+            (*frame).start = calloc(w->frame.length, sizeof(char));
+            (*frame).length = w->frame.length;
+        }
+
+        memcpy((*frame).start, w->frame.start, w->frame.length);
+    }
+
+    pthread_mutex_unlock(&w->mtx_frame);
 }
 
 /**
  * Main code
  */
+#ifdef WEBCAM_TEST
 int main(int argc, char **argv)
 {
     int i = 0;
@@ -451,13 +515,16 @@ int main(int argc, char **argv)
 
     // Prepare frame, and filename, and file to store frame in
     buffer_t frame;
+    frame.start = NULL;
+    frame.length = 0;
+
     char *fn = calloc(16, sizeof(char));
     FILE *fp;
 
-    webcam_resize(w, 1280, 1024);
+    webcam_resize(w, 640, 480);
     webcam_stream(w, true);
     while(true) {
-        frame = webcam_grab(w);
+        webcam_grab(w, &frame);
 
         if (frame.length > 0) {
             printf("Storing frame %d\n", i);
@@ -467,14 +534,15 @@ int main(int argc, char **argv)
             fclose(fp);
             i++;
         }
-        free(frame.start);
 
-        if (i > 50) break;
+        if (i > 10) break;
     }
     webcam_stream(w, false);
     webcam_close(w);
 
+    if (frame.start != NULL) free(frame.start);
     free(fn);
 
     return 0;
 }
+#endif
